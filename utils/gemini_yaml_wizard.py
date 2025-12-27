@@ -57,6 +57,9 @@ def generate_yaml_entry(data):
     if data['pricing'].get('free_tier'):
         pricing_section += "    free_tier: true\n"
 
+    if data['pricing'].get('excluded_features'):
+        pricing_section += f"    excluded_features: {format_list(data['pricing']['excluded_features'])}\n"
+
     pricing_section += "    input:\n" + chr(10).join([format_pricing_tier(t) for t in data['pricing']['input']]) + "\n"
     pricing_section += "    output:\n" + chr(10).join([format_pricing_tier(t) for t in data['pricing']['output']])
 
@@ -140,6 +143,9 @@ def main():
 
     print("\n--- Pricing ---")
     free_tier = get_bool_input("Free Tier Available", True)
+    excluded_features = []
+    if free_tier:
+        excluded_features = get_list_input("Excluded Features on Free Tier", [])
 
     # Simplified pricing input for wizard
     input_price = get_input("Input Price per Million (up to 128k/null)", default="0.10")
@@ -152,6 +158,8 @@ def main():
 
     if free_tier:
         pricing["free_tier"] = True
+        if excluded_features:
+            pricing["excluded_features"] = excluded_features
 
     if caps['caching']:
         try:
