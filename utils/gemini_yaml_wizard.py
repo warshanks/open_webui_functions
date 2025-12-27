@@ -145,7 +145,7 @@ def main():
     free_tier = get_bool_input("Free Tier Available", True)
     excluded_features = []
     if free_tier:
-        excluded_features = get_list_input("Excluded Features on Free Tier", [])
+        excluded_features = get_list_input("Excluded Features on Free Tier (e.g. search_grounding, grounding_google_maps)", [])
 
     # Simplified pricing input for wizard
     input_price = get_input("Input Price per Million (up to 128k/null)", default="0.10")
