@@ -2069,7 +2069,88 @@ class Pipe:
         log.debug(
             f"Getting genai client (potentially cached) for user {__user__['email']}."
         )
-        client = self._get_user_client(valves, __user__["email"])
+
+        # Determine the routing strategy (Free vs Paid API key)
+        # This overrides the standard client selection logic if we are performing cost-based routing.
+        client = None
+        routing_strategy = "STANDARD"
+
+        # Check for Free/Paid routing eligibility
+        # 1. Not using Vertex AI (Vertex is always "paid" or enterprise)
+        # 2. Both Free and Paid API keys are configured (otherwise routing is moot)
+        has_free_key = bool(valves.GEMINI_FREE_API_KEY)
+        has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
+        use_vertex = valves.USE_VERTEX_AI and valves.VERTEX_PROJECT
+
+        if not use_vertex and has_free_key and has_paid_key:
+            # We are in a position to route requests.
+            # Determine if the model is free-tier eligible.
+            model_id_for_routing = __metadata__.get("canonical_model_id")
+
+            # Only attempt advanced routing if we know the model configuration.
+            # If unknown, fallback to STANDARD (Free Key priority via _get_user_client).
+            if model_id_for_routing and model_id_for_routing in model_config:
+                pricing_info = model_config[model_id_for_routing].get("pricing", {})
+                is_free_model = pricing_info.get("free_tier", False)
+
+                if is_free_model:
+                    routing_strategy = "FREE_TIER_FIRST"
+
+                    # Check for feature exclusions on Free Tier
+                    excluded_features = pricing_info.get("excluded_features", [])
+
+                    # Check requested features
+                    features = __metadata__.get("features", {}) or {}
+
+                    # Search requested?
+                    is_search_requested = features.get("google_search_tool") or features.get("google_search_retrieval")
+                    if is_search_requested and "search_grounding" in excluded_features:
+                        log.info(f"Search requested but excluded on Free Tier for {model_id_for_routing}. Switching to PAID_ONLY.")
+                        routing_strategy = "PAID_ONLY"
+
+                    # Maps requested?
+                    # Check toggle status for Maps
+                    _, is_maps_toggled = self._get_toggleable_feature_status("gemini_maps_grounding_toggle", __metadata__)
+                    if is_maps_toggled and "grounding_google_maps" in excluded_features:
+                        log.info(f"Google Maps requested but excluded on Free Tier for {model_id_for_routing}. Switching to PAID_ONLY.")
+                        routing_strategy = "PAID_ONLY"
+
+                    log.info(f"Model {model_id_for_routing} routing strategy: {routing_strategy}")
+                else:
+                    routing_strategy = "PAID_ONLY"
+                    log.info(f"Model {model_id_for_routing} is NOT Free Tier eligible. Routing Strategy: {routing_strategy}")
+
+                # Execute client creation based on determined strategy
+                if routing_strategy == "FREE_TIER_FIRST":
+                    # Try Free Key first
+                    try:
+                        client = self._get_or_create_genai_client(
+                            free_api_key=valves.GEMINI_FREE_API_KEY,
+                            paid_api_key=None, # Force Free Key
+                            base_url=valves.GEMINI_API_BASE_URL,
+                        )
+                    except GenaiApiError as e:
+                        log.warning(f"Failed to initialize client with Free Key: {e}. Falling back to Paid Key.")
+                        client = self._get_or_create_genai_client(
+                            free_api_key=None,
+                            paid_api_key=valves.GEMINI_PAID_API_KEY,
+                            base_url=valves.GEMINI_API_BASE_URL,
+                        )
+                        routing_strategy = "PAID_FALLBACK_INIT"
+
+                elif routing_strategy == "PAID_ONLY":
+                    # Use Paid Key
+                    client = self._get_or_create_genai_client(
+                        free_api_key=None,
+                        paid_api_key=valves.GEMINI_PAID_API_KEY,
+                        base_url=valves.GEMINI_API_BASE_URL,
+                    )
+
+        # Fallback to standard logic (Vertex AI or single key) if no routing strategy was selected
+        # (e.g. unknown model, missing keys, or Vertex AI enabled)
+        if client is None:
+            client = self._get_user_client(valves, __user__["email"])
+
         __metadata__["is_vertex_ai"] = client.vertexai
         # Determine the correct API name for logging and status messages.
         api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
@@ -2170,45 +2251,132 @@ class Pipe:
             )
         )
 
-        if is_streaming:
-            # Streaming response
-            response_stream: AsyncIterator[types.GenerateContentResponse] = (
-                await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-            )
+        # Wrap the API call in a loop to handle retries for Free Tier fallbacks.
+        # Max 2 attempts: 1. Free Key, 2. Paid Key (if needed).
+        attempt = 0
+        max_attempts = 2 if routing_strategy == "FREE_TIER_FIRST" else 1
 
-            log.info(
-                "Streaming enabled. Returning AsyncGenerator from unified processor."
-            )
-            log.debug("pipe method has finished.")
-            return self._unified_response_processor(
-                response_stream,
-                __request__.app,
-                event_emitter,
-                __metadata__,
-            )
-        else:
-            # Non-streaming response.
-            # FIXME: Catch and handle any exceptions from the API call.
-            res = await client.aio.models.generate_content(**gen_content_args)
+        while attempt < max_attempts:
+            attempt += 1
+            current_api_key_type = "Free" if routing_strategy == "FREE_TIER_FIRST" and attempt == 1 else "Paid"
 
-            # Adapter: Create a simple, one-shot async generator that yields the
-            # single response object, making it behave like a stream.
-            async def single_item_stream(
-                response: types.GenerateContentResponse,
-            ) -> AsyncGenerator[types.GenerateContentResponse, None]:
-                yield response
+            try:
+                if is_streaming:
+                    # Streaming response
+                    # Note: generate_content_stream returns an AsyncIterator immediately,
+                    # but the actual API call might happen on the first iteration.
+                    # However, google-genai SDK usually validates credentials/quota on the initial request.
+                    # We need to capture the generator to pass to the processor.
+                    # If an error happens *during* streaming (e.g. 1st chunk), the unified processor handles it,
+                    # BUT for retry logic, we need to know if it failed immediately.
+                    # The unified processor consumes the stream. We can't easily "peek" and retry there.
+                    # However, 429 errors often happen on the initial connection.
 
-            log.info(
-                "Streaming disabled. Adapting full response and returning "
-                "AsyncGenerator from unified processor."
-            )
-            log.debug("pipe method has finished.")
-            return self._unified_response_processor(
-                single_item_stream(res),
-                __request__.app,
-                event_emitter,
-                __metadata__,
-            )
+                    response_stream: AsyncIterator[types.GenerateContentResponse] = (
+                        await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
+                    )
+
+                    # We wrap the response stream to intercept the first chunk for error handling if we need to retry?
+                    # Actually, self._unified_response_processor handles the iteration.
+                    # If we pass the stream to it, we lose control.
+                    # We need to implement the retry logic *inside* the stream generation or wrapper.
+                    # But _unified_response_processor expects a stream.
+
+                    # Alternative: We can't easily retry a stream once passed to the processor.
+                    # BUT, if we use a custom generator wrapper here, we can catch the first error.
+
+                    async def resilient_stream_wrapper(stream):
+                        try:
+                            async for chunk in stream:
+                                yield chunk
+                        except genai_errors.ClientError as e:
+                            # Verify if this is a retryable error (429/403) and we have a fallback.
+                            if attempt == 1 and routing_strategy == "FREE_TIER_FIRST" and (e.code == 429 or e.code == 403):
+                                raise e # Re-raise to be caught by the outer loop
+                            raise e
+
+                    log.info(
+                        f"Streaming enabled. Returning AsyncGenerator from unified processor. Attempt {attempt}/{max_attempts} ({current_api_key_type} Key)"
+                    )
+                    log.debug("pipe method has finished.")
+
+                    # Important: We can't just return here if we want to handle the exception from the stream!
+                    # The stream is consumed asynchronously by FastAPI/Open WebUI.
+                    # If we return the generator, the code execution leaves `pipe`.
+                    # To handle retries, we must ensure the `pipe` method can "swap" the stream.
+                    # But `pipe` must return *one* generator.
+
+                    # Solution: Create a meta-generator that manages the retries.
+                    async def meta_stream_generator():
+                        current_client = client
+                        current_attempt = attempt
+
+                        while True:
+                            try:
+                                stream = await current_client.aio.models.generate_content_stream(**gen_content_args)
+                                async for chunk in stream:
+                                    yield chunk
+                                break # Success, exit loop
+                            except genai_errors.ClientError as e:
+                                # Check for retry condition
+                                if current_attempt == 1 and routing_strategy == "FREE_TIER_FIRST" and (e.code == 429 or e.code == 403):
+                                    log.warning(f"Free Tier quota exceeded (Code {e.code}). Switching to Paid Key and retrying...")
+                                    asyncio.create_task(event_emitter.emit_status("Free quota exceeded, switching to Paid API...", done=False))
+
+                                    # Switch client
+                                    current_client = self._get_or_create_genai_client(
+                                        free_api_key=None,
+                                        paid_api_key=valves.GEMINI_PAID_API_KEY,
+                                        base_url=valves.GEMINI_API_BASE_URL,
+                                    )
+                                    current_attempt += 1
+                                    continue
+                                else:
+                                    raise e
+
+                    return self._unified_response_processor(
+                        meta_stream_generator(),
+                        __request__.app,
+                        event_emitter,
+                        __metadata__,
+                    )
+
+                else:
+                    # Non-streaming response.
+                    res = await client.aio.models.generate_content(**gen_content_args)
+
+                    # Adapter: Create a simple, one-shot async generator that yields the
+                    # single response object, making it behave like a stream.
+                    async def single_item_stream(
+                        response: types.GenerateContentResponse,
+                    ) -> AsyncGenerator[types.GenerateContentResponse, None]:
+                        yield response
+
+                    log.info(
+                        f"Streaming disabled. Adapting full response. Attempt {attempt}/{max_attempts} ({current_api_key_type} Key)"
+                    )
+                    return self._unified_response_processor(
+                        single_item_stream(res),
+                        __request__.app,
+                        event_emitter,
+                        __metadata__,
+                    )
+
+            except genai_errors.ClientError as e:
+                # Handle Non-Streaming errors (or initialization errors)
+                if attempt == 1 and routing_strategy == "FREE_TIER_FIRST" and (e.code == 429 or e.code == 403):
+                    log.warning(f"Free Tier quota exceeded (Code {e.code}). Switching to Paid Key and retrying...")
+                    asyncio.create_task(event_emitter.emit_status("Free quota exceeded, switching to Paid API...", done=False))
+                    # Switch client for next iteration
+                    client = self._get_or_create_genai_client(
+                        free_api_key=None,
+                        paid_api_key=valves.GEMINI_PAID_API_KEY,
+                        base_url=valves.GEMINI_API_BASE_URL,
+                    )
+                    continue
+                else:
+                    # Re-raise if not retryable or out of attempts
+                    raise e
 
     # region 2. Helper methods inside the Pipe class
 

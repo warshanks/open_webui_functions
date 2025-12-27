@@ -53,6 +53,13 @@ def generate_yaml_entry(data):
         return f"""      - up_to_tokens: {up_to}
         price_per_million: {tier['price_per_million']}"""
 
+    pricing_section = "  pricing:\n"
+    if data['pricing'].get('free_tier'):
+        pricing_section += "    free_tier: true\n"
+
+    pricing_section += "    input:\n" + chr(10).join([format_pricing_tier(t) for t in data['pricing']['input']]) + "\n"
+    pricing_section += "    output:\n" + chr(10).join([format_pricing_tier(t) for t in data['pricing']['output']])
+
     entry = f"""
 {data['model_id']}:
   description: "{data['description']}"
@@ -78,11 +85,7 @@ def generate_yaml_entry(data):
     structured_outputs: {str(data['caps']['structured_outputs']).lower()}
     thinking: {str(data['caps']['thinking']).lower()}
     url_context: {str(data['caps']['url_context']).lower()}
-  pricing:
-    input:
-{chr(10).join([format_pricing_tier(t) for t in data['pricing']['input']])}
-    output:
-{chr(10).join([format_pricing_tier(t) for t in data['pricing']['output']])}"""
+{pricing_section}"""
 
     if data['pricing'].get('caching'):
         entry += f"""
@@ -136,6 +139,8 @@ def main():
     }
 
     print("\n--- Pricing ---")
+    free_tier = get_bool_input("Free Tier Available", True)
+
     # Simplified pricing input for wizard
     input_price = get_input("Input Price per Million (up to 128k/null)", default="0.10")
     output_price = get_input("Output Price per Million (up to 128k/null)", default="0.40")
@@ -144,6 +149,9 @@ def main():
         "input": [{"up_to_tokens": None, "price_per_million": input_price}],
         "output": [{"up_to_tokens": None, "price_per_million": output_price}]
     }
+
+    if free_tier:
+        pricing["free_tier"] = True
 
     if caps['caching']:
         try:
