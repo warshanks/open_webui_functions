@@ -2023,7 +2023,10 @@ class Pipe:
 
         # Determine if a paid API (Vertex or Gemini Paid) is being used.
         # This is used later to decide whether to calculate and display cost.
-        __metadata__["is_paid_api"] = not bool(valves.GEMINI_FREE_API_KEY)
+        # The 'is_paid_api' flag determines whether cost is calculated for the request.
+        # We initialize it here; the routing logic below will refine it based
+        # on the actually selected client/tier.
+        __metadata__["is_paid_api"] = True
 
         # Retrieve model configuration from app state (loaded by companion filter)
         model_config = __request__.app.state._state.get("gemini_model_config")
@@ -2129,6 +2132,7 @@ class Pipe:
                             paid_api_key=None, # Force Free Key
                             base_url=valves.GEMINI_API_BASE_URL,
                         )
+                        __metadata__["is_paid_api"] = False
                     except GenaiApiError as e:
                         log.warning(f"Failed to initialize client with Free Key: {e}. Falling back to Paid Key.")
                         client = self._get_or_create_genai_client(
@@ -2136,6 +2140,7 @@ class Pipe:
                             paid_api_key=valves.GEMINI_PAID_API_KEY,
                             base_url=valves.GEMINI_API_BASE_URL,
                         )
+                        __metadata__["is_paid_api"] = True
                         routing_strategy = "PAID_FALLBACK_INIT"
 
                 elif routing_strategy == "PAID_ONLY":
@@ -2145,11 +2150,14 @@ class Pipe:
                         paid_api_key=valves.GEMINI_PAID_API_KEY,
                         base_url=valves.GEMINI_API_BASE_URL,
                     )
+                    __metadata__["is_paid_api"] = True
 
         # Fallback to standard logic (Vertex AI or single key) if no routing strategy was selected
         # (e.g. unknown model, missing keys, or Vertex AI enabled)
         if client is None:
             client = self._get_user_client(valves, __user__["email"])
+            # Update the flag based on the selected default client's tier
+            __metadata__["is_paid_api"] = client.vertexai or not bool(valves.GEMINI_FREE_API_KEY)
 
         __metadata__["is_vertex_ai"] = client.vertexai
         # Determine the correct API name for logging and status messages.
@@ -2331,6 +2339,7 @@ class Pipe:
                                         paid_api_key=valves.GEMINI_PAID_API_KEY,
                                         base_url=valves.GEMINI_API_BASE_URL,
                                     )
+                                    __metadata__["is_paid_api"] = True
                                     current_attempt += 1
                                     continue
                                 else:
@@ -2375,6 +2384,7 @@ class Pipe:
                         paid_api_key=valves.GEMINI_PAID_API_KEY,
                         base_url=valves.GEMINI_API_BASE_URL,
                     )
+                    __metadata__["is_paid_api"] = True
                     continue
                 else:
                     # Re-raise if not retryable or out of attempts
