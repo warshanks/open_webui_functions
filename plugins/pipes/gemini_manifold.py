@@ -2260,6 +2260,8 @@ class Pipe:
             attempt += 1
             current_api_key_type = "Free" if routing_strategy == "FREE_TIER_FIRST" and attempt == 1 else "Paid"
 
+            log.info(f"Attempt {attempt}: Routing request to {current_api_key_type} Tier.")
+
             try:
                 if is_streaming:
                     # Streaming response
